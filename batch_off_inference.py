@@ -66,6 +66,98 @@ def run_phrase_grounding(model, processor, device, image: Image.Image, text_inpu
     return parsed_answer
 
 
+def detect_nutrition_facts(model, processor, device, image: Image.Image):
+    """
+    Run Florence-2 object detection to find nutrition facts panels in an image.
+    Uses <OPEN_VOCABULARY_DETECTION> task to detect "nutrition facts" or "nutrition information".
+    Returns a dict with detection results and confidence score.
+    """
+    task_prompt = "<OPEN_VOCABULARY_DETECTION>"
+    text_input = "nutrition facts panel"
+    prompt = f"{task_prompt} {text_input}"
+
+    inputs = processor(text=prompt, images=image, return_tensors="pt")
+    if device.type == "mps":
+        inputs = inputs.to(device, torch.float16)
+        pixel_values = inputs["pixel_values"].to(device)
+    else:
+        inputs = inputs.to(device)
+        pixel_values = inputs["pixel_values"].to(device)
+
+    generated_ids = model.generate(
+        input_ids=inputs["input_ids"].to(device),
+        pixel_values=pixel_values,
+        max_new_tokens=1024,
+        early_stopping=False,
+        do_sample=False,
+        num_beams=3,
+    )
+
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    parsed_answer = processor.post_process_generation(
+        generated_text,
+        task=task_prompt,
+        image_size=(image.width, image.height),
+    )
+    return parsed_answer
+
+
+def extract_nutrition_panels(image: Image.Image, nutrition_results: dict, task_prompt: str, out_dir: str,
+                             image_index: int) -> List[str]:
+    """
+    Extract nutrition facts panels from detection results and save to out_dir.
+    Returns list of saved nutrition panel paths.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    saved_paths: List[str] = []
+    if task_prompt in nutrition_results:
+        task_results = nutrition_results[task_prompt]
+        bboxes = task_results.get("bboxes", [])
+        labels = task_results.get("labels", [])
+
+        if bboxes:
+            for i, bbox in enumerate(bboxes):
+                x1, y1, x2, y2 = bbox
+                # Use floor for start coords and ceil for end coords
+                x1 = int(math.floor(x1))
+                y1 = int(math.floor(y1))
+                x2 = int(math.ceil(x2))
+                y2 = int(math.ceil(y2))
+
+                # Clamp to image bounds
+                x1 = max(0, min(x1, image.width - 1))
+                y1 = max(0, min(y1, image.height - 1))
+                x2 = max(0, min(x2, image.width))
+                y2 = max(0, min(y2, image.height))
+
+                # Skip invalid or collapsed boxes
+                if x2 <= x1 or y2 <= y1:
+                    print(f"[INFO] Skipping invalid nutrition panel box {bbox} after clamping -> ({x1},{y1},{x2},{y2})")
+                    continue
+
+                cropped = image.crop((x1, y1, x2, y2))
+
+                raw_label = labels[i] if i < len(labels) else "nutrition_panel"
+                safe_label = (
+                    raw_label.replace(" ", "_")
+                    .replace("/", "-")
+                    .replace("\\", "-")
+                    .replace(":", "-")
+                )
+                filename = f"{safe_label}_{image_index}_{i}.png"
+                out_path = os.path.join(out_dir, filename)
+                try:
+                    cropped.save(out_path)
+                    saved_paths.append(out_path)
+                except Exception:
+                    out_path = os.path.join(out_dir, f"nutrition_panel_{image_index}_{i}.png")
+                    cropped.save(out_path)
+                    saved_paths.append(out_path)
+
+    return saved_paths
+
+
 def extract_and_save_crops(image: Image.Image, results: dict, task_prompt: str, out_dir: str, image_index: int) -> List[
     str]:
     """
@@ -126,11 +218,11 @@ def load_image_from_url(url: str) -> Image.Image:
     return Image.open(resp.raw).convert("RGB")
 
 
-def process_product(product_id: str, model, processor, device, text_override: str | None = None) -> list[str]:
+def process_product(product_id: str, model, processor, device, text_override: str | None = None) -> dict:
     """
     For a product_id, run phrase grounding across all image URLs, saving crops under images/{product_id}/.
-    Also saves the original images for reference.
-    Returns list of saved crop paths.
+    Also detects and saves nutrition facts panels to a separate folder.
+    Returns a dict with 'crops' and 'nutrition_panels' lists.
     """
     urls = get_images_for_product(product_id)
     product_data = get_product_data(product_id)
@@ -139,16 +231,20 @@ def process_product(product_id: str, model, processor, device, text_override: st
     base_out_dir = os.path.join("images", product_id)
     originals_dir = os.path.join(base_out_dir, "original")
     crops_dir = os.path.join(base_out_dir, "cropped")
+    nutrition_dir = os.path.join(base_out_dir, "nutrition_panels")
     florence_dir = os.path.join(base_out_dir, "florence_output")
     os.makedirs(originals_dir, exist_ok=True)
     os.makedirs(crops_dir, exist_ok=True)
+    os.makedirs(nutrition_dir, exist_ok=True)
     os.makedirs(florence_dir, exist_ok=True)
 
     print(f"Processing product {product_id} with title '{product_title}'")
     print(f"Found {len(urls)} image URL(s)")
 
     task_prompt = "<CAPTION_TO_PHRASE_GROUNDING>"
-    all_saved: list[str] = []
+    nutrition_task_prompt = "<OPEN_VOCABULARY_DETECTION>"
+    all_saved_crops: list[str] = []
+    all_saved_panels: list[str] = []
 
     for idx, url in enumerate(urls):
         try:
@@ -164,11 +260,11 @@ def process_product(product_id: str, model, processor, device, text_override: st
         except Exception as e:
             print(f"[WARN] Failed to save original image #{idx}: {e}")
 
-        # Run model
+        # Run phrase grounding for product name
         try:
             results = run_phrase_grounding(model, processor, device, image, text_input=product_title)
         except Exception as e:
-            print(f"[WARN] Inference failed for image #{idx}: {e}")
+            print(f"[WARN] Phrase grounding inference failed for image #{idx}: {e}")
             continue
 
         # Persist raw results for debugging
@@ -179,19 +275,53 @@ def process_product(product_id: str, model, processor, device, text_override: st
         except Exception as e:
             print(f"[WARN] Failed to save raw results #{idx}: {e}")
 
-        # Save crops
+        # Save crops from phrase grounding
         saved = extract_and_save_crops(image, results, task_prompt=task_prompt, out_dir=crops_dir, image_index=idx)
-        all_saved.extend(saved)
+        all_saved_crops.extend(saved)
         bboxes = results.get(task_prompt, {}).get("bboxes", [])
         if not bboxes:
-            print(f"Product {product_id} - Image #{idx}: no boxes returned, saved {len(saved)} crops to {crops_dir}")
+            print(
+                f"Product {product_id} - Image #{idx}: no product boxes returned, saved {len(saved)} crops to {crops_dir}")
         else:
-            print(f"Product {product_id} - Image #{idx}: {len(bboxes)} boxes, saved {len(saved)} crops to {crops_dir}")
+            print(
+                f"Product {product_id} - Image #{idx}: {len(bboxes)} product boxes, saved {len(saved)} crops to {crops_dir}")
+
+            # Run nutrition facts detection on each cropped image
+            for crop_idx, bbox in enumerate(bboxes):
+                x1, y1, x2, y2 = bbox
+                x1 = int(math.floor(x1))
+                y1 = int(math.floor(y1))
+                x2 = int(math.ceil(x2))
+                y2 = int(math.ceil(y2))
+
+                x1 = max(0, min(x1, image.width - 1))
+                y1 = max(0, min(y1, image.height - 1))
+                x2 = max(0, min(x2, image.width))
+                y2 = max(0, min(y2, image.height))
+
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                cropped_image = image.crop((x1, y1, x2, y2))
+
+                try:
+                    nutrition_results = detect_nutrition_facts(model, processor, device, cropped_image)
+                    # Pass idx as base and crop_idx as part of filename generation
+                    nutrition_panels = extract_nutrition_panels(cropped_image, nutrition_results, nutrition_task_prompt,
+                                                                nutrition_dir, idx * 1000 + crop_idx)
+                    if nutrition_panels:
+                        print(f"  └─ Crop #{crop_idx}: detected {len(nutrition_panels)} nutrition panel(s)")
+                        all_saved_panels.extend(nutrition_panels)
+                except Exception as e:
+                    print(f"[WARN] Nutrition facts detection failed for image #{idx}, crop #{crop_idx}: {e}")
 
     if not urls:
         print(f"[INFO] No image URLs found for product {product_id}")
 
-    return all_saved
+    return {
+        "crops": all_saved_crops,
+        "nutrition_panels": all_saved_panels
+    }
 
 
 def parse_args():
@@ -203,22 +333,25 @@ def parse_args():
 
 
 def run_batch_off_inference(product_id: str, model_id: str = "microsoft/Florence-2-large",
-                            text_prompt: str | None = None) -> list[str]:
+                            text_prompt: str | None = None) -> dict:
     """
-    Public callable function to run phrase grounding for all images of a product.
+    Public callable function to run phrase grounding and nutrition facts detection for all images of a product.
     This sets up the model and processor and then calls process_product.
 
     Usage:
         from batch_off_inference import run_batch_off_inference
-        run_batch_off_inference("0012000130311", text_prompt="Mountain Dew Baja Blast Tropical Lime")
-    Returns the list of saved crop paths.
+        result = run_batch_off_inference("0012000130311", text_prompt="Mountain Dew Baja Blast Tropical Lime")
+        print(result['crops'])  # List of cropped product images
+        print(result['nutrition_panels'])  # List of detected nutrition fact panels
+
+    Returns a dict with 'crops' and 'nutrition_panels' lists.
     """
     print(f"Loading model {model_id}...")
     model, processor, device = setup_model(model_id)
     print(f"Device: {device}")
-    saved = process_product(product_id, model, processor, device, text_override=text_prompt)
+    result = process_product(product_id, model, processor, device, text_override=text_prompt)
     print("Done.")
-    return saved
+    return result
 
 
 def main():
@@ -232,5 +365,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # run_batch_off_inference("0012000130311")
-    run_batch_off_inference("0027379002336")
+    run_batch_off_inference("0012000130311")
+    # run_batch_off_inference("0027379002336")
