@@ -103,24 +103,58 @@ def detect_nutrition_facts(model, processor, device, image: Image.Image):
 
 
 def extract_nutrition_panels(image: Image.Image, nutrition_results: dict, task_prompt: str, out_dir: str,
-                             image_index: int) -> List[str]:
+                             image_index: int, min_box_area_ratio: float = 0.05) -> List[str]:
     """
     Extract nutrition facts panels from detection results and save to out_dir.
     Only extracts the largest nutrition panel (by area) if multiple panels are detected.
+
+    Confidence checks:
+    - Only extracts if bounding boxes are returned
+    - Filters out boxes smaller than min_box_area_ratio of the image area (default 5%)
+    - Validates that labels contain nutrition-related keywords
+
+    Args:
+        image: The image to extract from
+        nutrition_results: Detection results from Florence-2
+        task_prompt: The task prompt used for detection
+        out_dir: Directory to save extracted panels
+        image_index: Index for filename generation
+        min_box_area_ratio: Minimum box area as ratio of image area (default 0.05 = 5%)
+
     Returns list with at most one saved nutrition panel path, or empty list if no panels found.
     """
     saved_paths: List[str] = []
 
     if task_prompt not in nutrition_results:
+        print(f"[INFO] No detection results for task '{task_prompt}' - skipping extraction")
         return saved_paths
 
     task_results = nutrition_results[task_prompt]
     bboxes = task_results.get("bboxes", [])
-    labels = task_results.get("labels", [])
+    labels = task_results.get("bboxes_labels", [])
 
     if not bboxes:
         # No panels detected, return empty list
+        print(f"[INFO] No bounding boxes detected - model not confident about nutrition panel presence")
         return saved_paths
+
+    # Validate labels contain nutrition-related keywords
+    nutrition_keywords = ["nutrition", "facts", "information", "panel", "label"]
+    has_nutrition_label = False
+    if labels:
+        for label in labels:
+            label_lower = label.lower()
+            if any(keyword in label_lower for keyword in nutrition_keywords):
+                has_nutrition_label = True
+                break
+
+    if not has_nutrition_label:
+        print(f"[INFO] Detected labels {labels} don't contain nutrition keywords - low confidence detection")
+        return saved_paths
+
+    # Calculate minimum acceptable box area
+    image_area = image.width * image.height
+    min_box_area = image_area * min_box_area_ratio
 
     # Filter valid bboxes and calculate their areas
     valid_boxes = []
@@ -144,6 +178,14 @@ def extract_nutrition_panels(image: Image.Image, nutrition_results: dict, task_p
 
         # Calculate area
         area = (x2 - x1) * (y2 - y1)
+
+        # Filter by minimum area ratio (confidence check)
+        if area < min_box_area:
+            area_ratio = area / image_area * 100
+            print(
+                f"[INFO] Skipping nutrition panel box {bbox} - too small ({area_ratio:.1f}% of image, minimum {min_box_area_ratio * 100}%)")
+            continue
+
         valid_boxes.append((i, x1, y1, x2, y2, area))
 
     if not valid_boxes:
@@ -282,7 +324,7 @@ def extract_and_save_crops(image: Image.Image, results: dict, task_prompt: str, 
         return saved_paths
 
     task_results = results[task_prompt]
-    labels = task_results.get("labels", [])
+    labels = task_results.get("bboxes_labels", [])
 
     # Get filtered boxes using the shared function
     kept_boxes = get_filtered_boxes(image, results, task_prompt)
@@ -399,6 +441,15 @@ def process_product(product_id: str, model, processor, device, text_override: st
 
                 try:
                     nutrition_results = detect_nutrition_facts(model, processor, device, cropped_image)
+
+                    # Save nutrition detection results to florence_output folder
+                    nutrition_results_path = os.path.join(florence_dir, f"nutrition_results_{idx}_{crop_idx}.json")
+                    try:
+                        with open(nutrition_results_path, "w", encoding="utf-8") as f:
+                            json.dump(nutrition_results, f, indent=2)
+                    except Exception as e:
+                        print(f"[WARN] Failed to save nutrition results for image #{idx}, crop #{crop_idx}: {e}")
+
                     # Pass idx as base and crop_idx as part of filename generation
                     nutrition_panels = extract_nutrition_panels(cropped_image, nutrition_results, nutrition_task_prompt,
                                                                 nutrition_dir, idx * 1000 + crop_idx)
