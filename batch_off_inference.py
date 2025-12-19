@@ -333,26 +333,15 @@ def extract_and_save_crops(image: Image.Image, results: dict, task_prompt: str, 
         return saved_paths
 
     # Save crops from filtered boxes
-    for box in kept_boxes:
+    for crop_idx, box in enumerate(kept_boxes):
         i, x1, y1, x2, y2, area = box
         cropped = image.crop((x1, y1, x2, y2))
 
-        raw_label = labels[i] if i < len(labels) else f"crop_{i}"
-        safe_label = (
-            raw_label.replace(" ", "_")
-            .replace("/", "-")
-            .replace("\\", "-")
-            .replace(":", "-")
-        )
-        filename = f"{safe_label}_{image_index}_{i}.png"
+        # Simple naming: crop_{original_image_index}_{crop_index}.png
+        filename = f"crop_{image_index}_{crop_idx}.png"
         out_path = os.path.join(out_dir, filename)
-        try:
-            cropped.save(out_path)
-            saved_paths.append(out_path)
-        except Exception:
-            out_path = os.path.join(out_dir, f"crop_{image_index}_{i}.png")
-            cropped.save(out_path)
-            saved_paths.append(out_path)
+        cropped.save(out_path)
+        saved_paths.append(out_path)
 
     return saved_paths
 
