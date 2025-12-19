@@ -106,108 +106,211 @@ def extract_nutrition_panels(image: Image.Image, nutrition_results: dict, task_p
                              image_index: int) -> List[str]:
     """
     Extract nutrition facts panels from detection results and save to out_dir.
-    Returns list of saved nutrition panel paths.
+    Only extracts the largest nutrition panel (by area) if multiple panels are detected.
+    Returns list with at most one saved nutrition panel path, or empty list if no panels found.
     """
+    saved_paths: List[str] = []
+
+    if task_prompt not in nutrition_results:
+        return saved_paths
+
+    task_results = nutrition_results[task_prompt]
+    bboxes = task_results.get("bboxes", [])
+    labels = task_results.get("labels", [])
+
+    if not bboxes:
+        # No panels detected, return empty list
+        return saved_paths
+
+    # Filter valid bboxes and calculate their areas
+    valid_boxes = []
+    for i, bbox in enumerate(bboxes):
+        x1, y1, x2, y2 = bbox
+        x1 = int(math.floor(x1))
+        y1 = int(math.floor(y1))
+        x2 = int(math.ceil(x2))
+        y2 = int(math.ceil(y2))
+
+        # Clamp to image bounds
+        x1 = max(0, min(x1, image.width - 1))
+        y1 = max(0, min(y1, image.height - 1))
+        x2 = max(0, min(x2, image.width))
+        y2 = max(0, min(y2, image.height))
+
+        # Skip invalid or collapsed boxes
+        if x2 <= x1 or y2 <= y1:
+            print(f"[INFO] Skipping invalid nutrition panel box {bbox} after clamping -> ({x1},{y1},{x2},{y2})")
+            continue
+
+        # Calculate area
+        area = (x2 - x1) * (y2 - y1)
+        valid_boxes.append((i, x1, y1, x2, y2, area))
+
+    if not valid_boxes:
+        return saved_paths
+
+    # Select only the largest panel by area
+    largest = max(valid_boxes, key=lambda x: x[5])
+    i, x1, y1, x2, y2, area = largest
+
+    # Only create directory if we have a valid panel to save
     os.makedirs(out_dir, exist_ok=True)
 
-    saved_paths: List[str] = []
-    if task_prompt in nutrition_results:
-        task_results = nutrition_results[task_prompt]
-        bboxes = task_results.get("bboxes", [])
-        labels = task_results.get("labels", [])
+    cropped = image.crop((x1, y1, x2, y2))
 
-        if bboxes:
-            for i, bbox in enumerate(bboxes):
-                x1, y1, x2, y2 = bbox
-                # Use floor for start coords and ceil for end coords
-                x1 = int(math.floor(x1))
-                y1 = int(math.floor(y1))
-                x2 = int(math.ceil(x2))
-                y2 = int(math.ceil(y2))
-
-                # Clamp to image bounds
-                x1 = max(0, min(x1, image.width - 1))
-                y1 = max(0, min(y1, image.height - 1))
-                x2 = max(0, min(x2, image.width))
-                y2 = max(0, min(y2, image.height))
-
-                # Skip invalid or collapsed boxes
-                if x2 <= x1 or y2 <= y1:
-                    print(f"[INFO] Skipping invalid nutrition panel box {bbox} after clamping -> ({x1},{y1},{x2},{y2})")
-                    continue
-
-                cropped = image.crop((x1, y1, x2, y2))
-
-                raw_label = labels[i] if i < len(labels) else "nutrition_panel"
-                safe_label = (
-                    raw_label.replace(" ", "_")
-                    .replace("/", "-")
-                    .replace("\\", "-")
-                    .replace(":", "-")
-                )
-                filename = f"{safe_label}_{image_index}_{i}.png"
-                out_path = os.path.join(out_dir, filename)
-                try:
-                    cropped.save(out_path)
-                    saved_paths.append(out_path)
-                except Exception:
-                    out_path = os.path.join(out_dir, f"nutrition_panel_{image_index}_{i}.png")
-                    cropped.save(out_path)
-                    saved_paths.append(out_path)
+    raw_label = labels[i] if i < len(labels) else "nutrition_panel"
+    safe_label = (
+        raw_label.replace(" ", "_")
+        .replace("/", "-")
+        .replace("\\", "-")
+        .replace(":", "-")
+    )
+    filename = f"{safe_label}_{image_index}.png"
+    out_path = os.path.join(out_dir, filename)
+    try:
+        cropped.save(out_path)
+        saved_paths.append(out_path)
+    except Exception:
+        out_path = os.path.join(out_dir, f"nutrition_panel_{image_index}.png")
+        cropped.save(out_path)
+        saved_paths.append(out_path)
 
     return saved_paths
+
+
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union between two boxes."""
+    _, x1_1, y1_1, x2_1, y2_1, _ = box1
+    _, x1_2, y1_2, x2_2, y2_2, _ = box2
+
+    # Calculate intersection
+    xi1 = max(x1_1, x1_2)
+    yi1 = max(y1_1, y1_2)
+    xi2 = min(x2_1, x2_2)
+    yi2 = min(y2_1, y2_2)
+
+    if xi2 <= xi1 or yi2 <= yi1:
+        return 0.0
+
+    intersection = (xi2 - xi1) * (yi2 - yi1)
+
+    # Calculate union
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union = area1 + area2 - intersection
+
+    return intersection / union if union > 0 else 0.0
+
+
+def get_filtered_boxes(image: Image.Image, results: dict, task_prompt: str, iou_threshold: float = 0.5):
+    """
+    Extract and filter bounding boxes from results using IoU threshold.
+    Returns list of filtered boxes in format: [(original_index, x1, y1, x2, y2, area), ...]
+    Only keeps the largest box when boxes are too similar (IoU > threshold).
+    """
+    if task_prompt not in results:
+        return []
+
+    task_results = results[task_prompt]
+    bboxes = task_results.get("bboxes", [])
+
+    # Normalize and validate boxes
+    valid_boxes = []
+    for i, bbox in enumerate(bboxes):
+        x1, y1, x2, y2 = bbox
+        x1 = int(math.floor(x1))
+        y1 = int(math.floor(y1))
+        x2 = int(math.ceil(x2))
+        y2 = int(math.ceil(y2))
+
+        # Clamp to image bounds
+        x1 = max(0, min(x1, image.width - 1))
+        y1 = max(0, min(y1, image.height - 1))
+        x2 = max(0, min(x2, image.width))
+        y2 = max(0, min(y2, image.height))
+
+        # Skip invalid or collapsed boxes
+        if x2 <= x1 or y2 <= y1:
+            print(f"[INFO] Skipping invalid box {bbox} after clamping -> ({x1},{y1},{x2},{y2})")
+            continue
+
+        area = (x2 - x1) * (y2 - y1)
+        valid_boxes.append((i, x1, y1, x2, y2, area))
+
+    if not valid_boxes:
+        return []
+
+    # Filter similar boxes using IoU threshold - keep only the largest
+    kept_boxes = []
+    used_indices = set()
+
+    # Sort by area descending to process largest boxes first
+    sorted_boxes = sorted(valid_boxes, key=lambda x: x[5], reverse=True)
+
+    for box in sorted_boxes:
+        idx = box[0]
+        if idx in used_indices:
+            continue
+
+        # Check if this box is similar to any already kept box
+        is_similar = False
+        for kept_box in kept_boxes:
+            iou = calculate_iou(box, kept_box)
+            if iou > iou_threshold:
+                is_similar = True
+                break
+
+        if not is_similar:
+            kept_boxes.append(box)
+            used_indices.add(idx)
+
+    print(f"[INFO] Filtered {len(valid_boxes)} boxes to {len(kept_boxes)} unique boxes (removed duplicates)")
+    return kept_boxes
 
 
 def extract_and_save_crops(image: Image.Image, results: dict, task_prompt: str, out_dir: str, image_index: int) -> List[
     str]:
     """
-    Extract cropped images from results and save to out_dir. Returns list of saved file paths.
+    Extract cropped images from results and save to out_dir.
+    Filters out similar boxes (using IoU threshold) and keeps only the largest box.
+    Returns list of saved file paths.
     """
     os.makedirs(out_dir, exist_ok=True)
 
     saved_paths: List[str] = []
-    if task_prompt in results:
-        task_results = results[task_prompt]
-        bboxes = task_results.get("bboxes", [])
-        labels = task_results.get("labels", [])
+    if task_prompt not in results:
+        return saved_paths
 
-        for i, bbox in enumerate(bboxes):
-            x1, y1, x2, y2 = bbox
-            # Use floor for start coords and ceil for end coords to avoid collapsing very small boxes
-            x1 = int(math.floor(x1))
-            y1 = int(math.floor(y1))
-            x2 = int(math.ceil(x2))
-            y2 = int(math.ceil(y2))
+    task_results = results[task_prompt]
+    labels = task_results.get("labels", [])
 
-            # Clamp to image bounds
-            x1 = max(0, min(x1, image.width - 1))
-            y1 = max(0, min(y1, image.height - 1))
-            x2 = max(0, min(x2, image.width))
-            y2 = max(0, min(y2, image.height))
+    # Get filtered boxes using the shared function
+    kept_boxes = get_filtered_boxes(image, results, task_prompt)
 
-            # Skip invalid or collapsed boxes
-            if x2 <= x1 or y2 <= y1:
-                print(f"[INFO] Skipping invalid box {bbox} after clamping -> ({x1},{y1},{x2},{y2})")
-                continue
+    if not kept_boxes:
+        return saved_paths
 
-            cropped = image.crop((x1, y1, x2, y2))
+    # Save crops from filtered boxes
+    for box in kept_boxes:
+        i, x1, y1, x2, y2, area = box
+        cropped = image.crop((x1, y1, x2, y2))
 
-            raw_label = labels[i] if i < len(labels) else f"crop_{i}"
-            safe_label = (
-                raw_label.replace(" ", "_")
-                .replace("/", "-")
-                .replace("\\", "-")
-                .replace(":", "-")
-            )
-            filename = f"{safe_label}_{image_index}_{i}.png"
-            out_path = os.path.join(out_dir, filename)
-            try:
-                cropped.save(out_path)
-                saved_paths.append(out_path)
-            except Exception:
-                out_path = os.path.join(out_dir, f"crop_{image_index}_{i}.png")
-                cropped.save(out_path)
-                saved_paths.append(out_path)
+        raw_label = labels[i] if i < len(labels) else f"crop_{i}"
+        safe_label = (
+            raw_label.replace(" ", "_")
+            .replace("/", "-")
+            .replace("\\", "-")
+            .replace(":", "-")
+        )
+        filename = f"{safe_label}_{image_index}_{i}.png"
+        out_path = os.path.join(out_dir, filename)
+        try:
+            cropped.save(out_path)
+            saved_paths.append(out_path)
+        except Exception:
+            out_path = os.path.join(out_dir, f"crop_{image_index}_{i}.png")
+            cropped.save(out_path)
+            saved_paths.append(out_path)
 
     return saved_paths
 
@@ -278,6 +381,10 @@ def process_product(product_id: str, model, processor, device, text_override: st
         # Save crops from phrase grounding
         saved = extract_and_save_crops(image, results, task_prompt=task_prompt, out_dir=crops_dir, image_index=idx)
         all_saved_crops.extend(saved)
+
+        # Get the filtered boxes for nutrition detection (same IoU filtering)
+        filtered_boxes = get_filtered_boxes(image, results, task_prompt)
+
         bboxes = results.get(task_prompt, {}).get("bboxes", [])
         if not bboxes:
             print(
@@ -286,22 +393,8 @@ def process_product(product_id: str, model, processor, device, text_override: st
             print(
                 f"Product {product_id} - Image #{idx}: {len(bboxes)} product boxes, saved {len(saved)} crops to {crops_dir}")
 
-            # Run nutrition facts detection on each cropped image
-            for crop_idx, bbox in enumerate(bboxes):
-                x1, y1, x2, y2 = bbox
-                x1 = int(math.floor(x1))
-                y1 = int(math.floor(y1))
-                x2 = int(math.ceil(x2))
-                y2 = int(math.ceil(y2))
-
-                x1 = max(0, min(x1, image.width - 1))
-                y1 = max(0, min(y1, image.height - 1))
-                x2 = max(0, min(x2, image.width))
-                y2 = max(0, min(y2, image.height))
-
-                if x2 <= x1 or y2 <= y1:
-                    continue
-
+            # Run nutrition facts detection only on the filtered unique crops
+            for crop_idx, (_, x1, y1, x2, y2, _) in enumerate(filtered_boxes):
                 cropped_image = image.crop((x1, y1, x2, y2))
 
                 try:
