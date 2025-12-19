@@ -232,4 +232,5 @@ def main():
 
 
 if __name__ == "__main__":
-    run_batch_off_inference("0012000130311")
+    # run_batch_off_inference("0012000130311")
+    run_batch_off_inference("0027379002336")
