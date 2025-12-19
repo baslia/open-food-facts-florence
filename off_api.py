@@ -5,15 +5,10 @@ import os
 import zipfile
 
 
-
 def zip_images(image_paths, zip_path):
     with zipfile.ZipFile(zip_path, 'w') as zipf:
         for img in image_paths:
             zipf.write(img, os.path.basename(img))
-
-
-
-
 
 
 def _split_barcode_for_path(barcode: str) -> str:
@@ -32,7 +27,7 @@ def _split_barcode_for_path(barcode: str) -> str:
         return barcode
 
 
-def get_product_image_data(product_id: str) -> dict or None:
+def get_product_data(product_id: str) -> dict or None:
     """
     Fetches product information from the Open Food Facts API, including image data.
 
@@ -116,7 +111,7 @@ def get_images_for_product(
         list: A list of image URLs for the product.
     """
     image_urls = []
-    all_data = get_product_image_data(product_id)
+    all_data = get_product_data(product_id)
 
     if not all_data:
         print(f"Could not retrieve data for product ID: {product_id}")
@@ -175,3 +170,6 @@ if __name__ == "__main__":
     test_product_id = "0012000130311"  # Example product ID
     image_urls = get_images_for_product(test_product_id)
     print(f"Image URLs: {image_urls}")
+
+    product_data = get_product_data(test_product_id)
+    print(f"Product Data: {product_data}")
