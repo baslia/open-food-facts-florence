@@ -103,7 +103,7 @@ def detect_nutrition_facts(model, processor, device, image: Image.Image):
 
 
 def extract_nutrition_panels(image: Image.Image, nutrition_results: dict, task_prompt: str, out_dir: str,
-                             image_index: int, min_box_area_ratio: float = 0.05) -> List[str]:
+                             image_index: str, min_box_area_ratio: float = 0.05) -> List[str]:
     """
     Extract nutrition facts panels from detection results and save to out_dir.
     Only extracts the largest nutrition panel (by area) if multiple panels are detected.
@@ -323,9 +323,6 @@ def extract_and_save_crops(image: Image.Image, results: dict, task_prompt: str, 
     if task_prompt not in results:
         return saved_paths
 
-    task_results = results[task_prompt]
-    labels = task_results.get("bboxes_labels", [])
-
     # Get filtered boxes using the shared function
     kept_boxes = get_filtered_boxes(image, results, task_prompt)
 
@@ -425,10 +422,44 @@ def process_product(product_id: str, model, processor, device, text_override: st
                 f"Product {product_id} - Image #{idx}: {len(bboxes)} product boxes, saved {len(saved)} crops to {crops_dir}")
 
             # Run nutrition facts detection only on the filtered unique crops
-            for crop_idx, (_, x1, y1, x2, y2, _) in enumerate(filtered_boxes):
+            for crop_idx, ((_, x1, y1, x2, y2, _)) in enumerate(filtered_boxes):
                 cropped_image = image.crop((x1, y1, x2, y2))
 
                 try:
+                    # 1) Run detailed caption on the cropped image
+                    caption_results = run_detailed_caption(model, processor, device, cropped_image)
+                    caption_task = "<MORE_DETAILED_CAPTION>"
+                    # Persist caption results for debugging/auditing
+                    caption_path = os.path.join(florence_dir, f"caption_{idx}_{crop_idx}.json")
+                    try:
+                        with open(caption_path, "w", encoding="utf-8") as f:
+                            json.dump(caption_results, f, indent=2)
+                    except Exception as e:
+                        print(f"[WARN] Failed to save caption results for image #{idx}, crop #{crop_idx}: {e}")
+
+                    # 2) Check for nutrition keywords in the caption content
+                    caption_text = ""
+                    if caption_task in caption_results:
+                        # Florence returns 'caption' or similar fields; be defensive in extraction
+                        cr = caption_results[caption_task]
+                        if isinstance(cr, dict):
+                            # Try common keys
+                            caption_text = cr.get("caption", "") or cr.get("text", "") or ""
+                        elif isinstance(cr, str):
+                            caption_text = cr
+
+                    nutrition_keywords = ["nutrition", "facts", "nutritional", "calories",
+                                          "carbohydrate", "protein"]
+                    caption_has_nutrition = False
+                    if caption_text:
+                        low = caption_text.lower()
+                        caption_has_nutrition = any(k in low for k in nutrition_keywords)
+
+                    if not caption_has_nutrition:
+                        print(f"  └─ Crop #{crop_idx}: caption did not indicate nutrition panel; skipping detection")
+                        continue
+
+                    # 3) Run nutrition facts detection only if caption suggests it
                     nutrition_results = detect_nutrition_facts(model, processor, device, cropped_image)
 
                     # Save nutrition detection results to florence_output folder
@@ -441,7 +472,7 @@ def process_product(product_id: str, model, processor, device, text_override: st
 
                     # Pass idx as base and crop_idx as part of filename generation
                     nutrition_panels = extract_nutrition_panels(cropped_image, nutrition_results, nutrition_task_prompt,
-                                                                nutrition_dir, idx * 1000 + crop_idx)
+                                                                nutrition_dir, f"{idx}_{crop_idx}")
                     if nutrition_panels:
                         print(f"  └─ Crop #{crop_idx}: detected {len(nutrition_panels)} nutrition panel(s)")
                         all_saved_panels.extend(nutrition_panels)
@@ -455,6 +486,40 @@ def process_product(product_id: str, model, processor, device, text_override: st
         "crops": all_saved_crops,
         "nutrition_panels": all_saved_panels
     }
+
+
+def run_detailed_caption(model, processor, device, image: Image.Image) -> dict:
+    """
+    Run Florence-2 '<MORE_DETAILED_CAPTION>' on a single image.
+    Returns the parsed answer dict { '<MORE_DETAILED_CAPTION>': { ... } }.
+    """
+    task_prompt = "<MORE_DETAILED_CAPTION>"
+    prompt = task_prompt
+
+    inputs = processor(text=prompt, images=image, return_tensors="pt")
+    if device.type == "mps":
+        inputs = inputs.to(device, torch.float16)
+        pixel_values = inputs["pixel_values"].to(device)
+    else:
+        inputs = inputs.to(device)
+        pixel_values = inputs["pixel_values"].to(device)
+
+    generated_ids = model.generate(
+        input_ids=inputs["input_ids"].to(device),
+        pixel_values=pixel_values,
+        max_new_tokens=1024,
+        early_stopping=False,
+        do_sample=False,
+        num_beams=3,
+    )
+
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    parsed_answer = processor.post_process_generation(
+        generated_text,
+        task=task_prompt,
+        image_size=(image.width, image.height),
+    )
+    return parsed_answer
 
 
 def parse_args():
