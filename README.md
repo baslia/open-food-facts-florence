@@ -38,6 +38,7 @@ locate products, crop them, caption them, and detect nutrition facts panels.
 - `nutrition_panels/`: extracted nutrition panel crops
 - `florence_output/`: raw Florence JSON (`results_0.json`), detailed captions (`caption_0_0.json`), nutrition
   detections (`nutrition_results_0_0.json`)
+- `side-by-side/`: side-by-side comparisons of original and cropped images (`comparison_0_0.png`, ...)
 
 ## Setup
 
@@ -70,6 +71,30 @@ python batch_off_inference.py 0012000130311
 python batch_off_inference.py 0012000130311 --model-id microsoft/Florence-2-large --text-prompt "Custom product name"
 ```
 
+### Generate Side-by-Side Comparisons
+
+After running inference, generate visual comparisons of original and cropped images:
+
+```python
+from side_by_side_comparison import generate_side_by_side_comparisons
+
+# Generate comparisons with default settings
+generate_side_by_side_comparisons("0012000130311")
+
+# Or with custom image width and gap
+generate_side_by_side_comparisons("0012000130311", max_width=800, gap=15)
+```
+
+CLI invocation:
+
+```bash
+python side_by_side_comparison.py 0012000130311
+# optional overrides
+python side_by_side_comparison.py 0012000130311 --max-width 800 --gap 15
+```
+
+Images are saved to `images/<product_id>/side-by-side/`.
+
 ## Flow (Mermaid)
 
 ```mermaid
@@ -96,6 +121,7 @@ graph TD
   `zip_images`.
 - `batch_off_inference.py`: `setup_model`, `run_phrase_grounding`, `run_detailed_caption`, `detect_nutrition_facts`,
   `extract_and_save_crops`, `extract_nutrition_panels`, `process_product`, `run_batch_off_inference`.
+- `side_by_side_comparison.py`: `get_crop_pairs`, `create_side_by_side`, `generate_side_by_side_comparisons`.
 
 ## Practical tips
 
