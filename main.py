@@ -1,0 +1,7 @@
+from batch_off_inference import run_batch_off_inference
+from side_by_side_comparison import generate_side_by_side_comparisons
+
+product_id = "0012000130311"
+
+run_batch_off_inference(product_id)
+generate_side_by_side_comparisons(product_id)
